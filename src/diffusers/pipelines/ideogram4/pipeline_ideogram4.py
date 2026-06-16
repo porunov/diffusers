@@ -419,6 +419,10 @@ class Ideogram4Pipeline(DiffusionPipeline, Ideogram4LoraLoaderMixin):
         return self._num_timesteps
 
     @property
+    def attention_kwargs(self) -> dict[str, Any] | None:
+        return self._attention_kwargs
+
+    @property
     def interrupt(self) -> bool:
         return self._interrupt
 
@@ -486,6 +490,7 @@ class Ideogram4Pipeline(DiffusionPipeline, Ideogram4LoraLoaderMixin):
         latents: torch.Tensor | None = None,
         output_type: str = "pil",
         return_dict: bool = True,
+        attention_kwargs: dict[str, Any] | None = None,
         callback_on_step_end: Callable[["Ideogram4Pipeline", int, int, dict[str, Any]], dict[str, Any]] | None = None,
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
     ) -> Ideogram4PipelineOutput | tuple[Any]:
@@ -534,6 +539,9 @@ class Ideogram4Pipeline(DiffusionPipeline, Ideogram4LoraLoaderMixin):
                 One of `"pil"`, `"np"`, `"pt"`, or `"latent"`.
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether to return an [`~pipelines.ideogram4.Ideogram4PipelineOutput`].
+            attention_kwargs (`dict`, *optional*):
+                A kwargs dictionary passed along to the attention processor of each transformer. A `"scale"` entry
+                scales the loaded LoRA weights (e.g. `{"scale": 0.7}`) when the PEFT backend is active.
             callback_on_step_end (`Callable`, *optional*):
                 Callback invoked at the end of every denoising step.
             callback_on_step_end_tensor_inputs (`list[str]`, *optional*):
@@ -561,6 +569,7 @@ class Ideogram4Pipeline(DiffusionPipeline, Ideogram4LoraLoaderMixin):
 
         device = self._execution_device
         self._guidance_scale = guidance_scale
+        self._attention_kwargs = attention_kwargs
         self._interrupt = False
 
         # 0. Optionally rewrite the prompt(s) into Ideogram4's native structured JSON caption.
@@ -670,6 +679,7 @@ class Ideogram4Pipeline(DiffusionPipeline, Ideogram4LoraLoaderMixin):
                     position_ids=position_ids,
                     segment_ids=segment_ids,
                     indicator=indicator,
+                    attention_kwargs=self.attention_kwargs,
                     return_dict=False,
                 )[0]
                 # Velocity (and guidance) is computed in float32 for scheduler precision; the transformers
@@ -684,6 +694,7 @@ class Ideogram4Pipeline(DiffusionPipeline, Ideogram4LoraLoaderMixin):
                     position_ids=neg_position_ids,
                     segment_ids=neg_segment_ids,
                     indicator=neg_indicator,
+                    attention_kwargs=self.attention_kwargs,
                     return_dict=False,
                 )[0].to(torch.float32)
 
