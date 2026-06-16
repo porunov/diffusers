@@ -50,7 +50,7 @@ import torch
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
+from accelerate.utils import AutocastKwargs, DistributedDataParallelKwargs, ProjectConfiguration, set_seed
 from huggingface_hub import create_repo, upload_folder
 from huggingface_hub.utils import insecure_hashlib
 from peft import LoraConfig, prepare_model_for_kbit_training, set_peft_model_state_dict
@@ -320,7 +320,9 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--do_fp8_training",
         action="store_true",
-        help="if we are doing FP8 training.",
+        help="Train in fp8. The path is chosen from the checkpoint: an already-SDNQ-quantized base (fp8 or "
+        "4bit) is trained in-place in fp8 via `sdnq` (fp8 scaled matmul, lower VRAM); a full-precision base "
+        "is converted to fp8 with torchao. A bitsandbytes nf4 checkpoint is not supported with this flag.",
     )
     parser.add_argument(
         "--variant",
@@ -655,6 +657,12 @@ def parse_args(input_args=None):
         type=float,
         default=1.5,
         help="Std of the logit-normal sigma schedule. Defaults to 1.5 to match the Ideogram4 pipeline.",
+    )
+    parser.add_argument(
+        "--disable_training_autocast",
+        action="store_true",
+        help="Disable accelerate's mixed-precision autocast on the training forward. Ideogram4's forward is "
+        "corrupted by bf16 autocast (gray/noisy), so the LoRA otherwise trains against corrupted predictions.",
     )
     parser.add_argument(
         "--mode_scale",
@@ -1127,19 +1135,41 @@ def main(args):
         raise ValueError(
             "Mixed precision training with bfloat16 is not supported on MPS. Please use fp16 (recommended) or fp32 instead."
         )
+    fp8_is_sdnq = False
     if args.do_fp8_training:
-        from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+        # Pick the fp8 path from the checkpoint: an already-SDNQ-quantized base trains in fp8 in-place
+        # (sdnq), a full-precision base is converted to fp8 with torchao (nf4 is rejected below).
+        _transformer_quant_config = Ideogram4Transformer2DModel.load_config(
+            args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision
+        ).get("quantization_config")
+        fp8_is_sdnq = _transformer_quant_config is not None and "sdnq" in str(
+            _transformer_quant_config.get("quant_method", "")
+        ).lower()
+        if fp8_is_sdnq:
+            # SDNQ registers its quantization backend on import; required to load the SDNQ checkpoint.
+            try:
+                import sdnq  # noqa: F401
+            except ImportError:
+                raise ImportError(
+                    "Training an SDNQ-quantized fp8 checkpoint requires the sdnq library: `pip install sdnq`."
+                )
 
     logging_dir = Path(args.output_dir, args.logging_dir)
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
-    kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    kwargs_handlers = [DistributedDataParallelKwargs(find_unused_parameters=True)]
+    if args.disable_training_autocast:
+        # Ideogram4's forward is corrupted by torch.autocast (bf16 -> gray/noisy; see log_validation), so the
+        # LoRA would otherwise train against corrupted predictions. Disable accelerate's mixed-precision
+        # autocast on the forward; we instead feed the transformer its inputs in weight_dtype ourselves
+        # (below), matching the clean inference path.
+        kwargs_handlers.append(AutocastKwargs(enabled=False))
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,
-        kwargs_handlers=[kwargs],
+        kwargs_handlers=kwargs_handlers,
     )
 
     # Disable AMP for MPS.
@@ -1302,6 +1332,19 @@ def main(args):
         quantization_config=quantization_config,
         torch_dtype=weight_dtype,
     )
+    if args.do_fp8_training and fp8_is_sdnq:
+        # Train the SDNQ checkpoint directly in fp8 (no dequantize-to-bf16): fp8 scaled matmul on the
+        # forward and backward pass, keeping the fp8 weights (lower VRAM than a bf16 base).
+        from sdnq.training import convert_sdnq_model_to_training
+
+        transformer = convert_sdnq_model_to_training(
+            transformer,
+            quantized_matmul_dtype="float8_e4m3fn",
+            use_grad_ckpt=args.gradient_checkpointing,
+            use_quantized_matmul=True,
+            use_stochastic_rounding=True,
+            dequantize_fp32=True,
+        )
     if args.bnb_quantization_config_path is not None:
         transformer = prepare_model_for_kbit_training(transformer, use_gradient_checkpointing=False)
 
@@ -1344,7 +1387,15 @@ def main(args):
     if not is_fsdp:
         transformer.to(**transformer_to_kwargs)
 
-    if args.do_fp8_training:
+    if args.do_fp8_training and not fp8_is_sdnq:
+        if transformer_is_quantized:
+            raise ValueError(
+                "`--do_fp8_training` on a pre-quantized checkpoint is only supported for SDNQ checkpoints "
+                "(fp8 or 4bit). A bitsandbytes nf4 checkpoint is already a 4-bit QLoRA base; train it without "
+                "`--do_fp8_training`."
+            )
+        from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+
         convert_to_float8_training(
             transformer, module_filter_fn=module_filter_fn, config=Float8LinearConfig(pad_inner_dim=True)
         )
@@ -1902,6 +1953,13 @@ def main(args):
                 # Ideogram4 model time t = 1 - sigma (0=noise, 1=data), shaped (B,).
                 model_timestep = (1.0 - sigmas).reshape(bsz)
 
+                if args.disable_training_autocast:
+                    # Without accelerate's autocast we must feed the transformer inputs in its compute
+                    # dtype ourselves (the latents/text features are float32), exactly as the pipeline does.
+                    packed_hidden_states = packed_hidden_states.to(weight_dtype)
+                    prompt_embeds = prompt_embeds.to(weight_dtype)
+                    model_timestep = model_timestep.to(weight_dtype)
+
                 # Predict the velocity; only the image positions carry a meaningful prediction.
                 model_pred = transformer(
                     hidden_states=packed_hidden_states,
@@ -2072,6 +2130,13 @@ def main(args):
                 variant=args.variant,
                 torch_dtype=weight_dtype,
             )
+            if args.do_fp8_training and fp8_is_sdnq:
+                # A freshly-loaded SDNQ fp8 base can't run plain inference (no fp8 `addmm` kernel), so
+                # dequantize it to bf16 for the final validation before loading the trained LoRA on top.
+                from sdnq.quantizer import dequantize_sdnq_model
+
+                pipeline.transformer = dequantize_sdnq_model(pipeline.transformer)
+                pipeline.unconditional_transformer = dequantize_sdnq_model(pipeline.unconditional_transformer)
             # load attention processors
             pipeline.load_lora_weights(args.output_dir)
 
@@ -2093,7 +2158,7 @@ def main(args):
         validation_prompt = args.validation_prompt if args.validation_prompt else args.final_validation_prompt
         quant_training = None
         if args.do_fp8_training:
-            quant_training = "FP8 TorchAO"
+            quant_training = "FP8 SDNQ" if fp8_is_sdnq else "FP8 TorchAO"
         elif args.bnb_quantization_config_path:
             quant_training = "BitsandBytes"
         save_model_card(
